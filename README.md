@@ -43,7 +43,8 @@ dynamic_weighted_sampler = { version = "0.1", features = ["serde"] }
 ```rust
 use dynamic_weighted_sampler::DynamicWeightedSampler;
 
-let mut sampler = DynamicWeightedSampler::new();
+let max_value = 10.;
+let mut sampler = DynamicWeightedSampler::new(max_value);
 sampler.insert(1, 4.);  // 80% of the mass
 sampler.insert(2, 1.); // 20% of the mass
 

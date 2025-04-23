@@ -1,6 +1,6 @@
 [package]
 name = "dynamic-weighted-sampler"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Germán Kruszewski <germank@gmail.com>"]
 description = "An efficient weighted sampler with dynamically updatable weights"
