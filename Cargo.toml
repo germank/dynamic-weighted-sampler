@@ -1,0 +1,24 @@
+[package]
+name = "dynamic-weighted-sampler"
+version = "0.1.0"
+edition = "2021"
+authors = ["Germán Kruszewski <germank@gmail.com>"]
+description = "An efficient weighted sampler with dynamically updatable weights"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/germank/dynamic-weighted-sampler"
+readme = "README.md"
+keywords = ["weighted", "sampler", "dynamic", "updatable"]
+categories = ["algorithms"]
+
+[features]
+default = []  # No features enabled by default
+serde = ["dep:serde"]
+
+[dependencies]
+rand = "0.9.1"
+rand_distr = "0.5.1"
+serde = { version = "1.0.219", optional = true }
+sugars = "3.0.1"
+
+[dev-dependencies]
+approx = "0.5.1"
