@@ -106,6 +106,10 @@ impl DynamicWeightedSampler {
     }
 
     pub fn update(&mut self, id: usize, new_weight: f64) {
+        if self.get_weight(id) == new_weight {
+            // nothing to do
+            return;
+        }
         if new_weight == 0. {
             // remove it completely if the weight is 0
             self.remove(id);
