@@ -160,9 +160,9 @@ impl DynamicWeightedSampler {
         self.total_weight
     }
 
-    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<usize> {
         assert!(self.total_weight <= self.max_value, "weighted sampler total weight {} is bigger than max weight {}.", self.total_weight, self.max_value);
-        let levels_sampler = WeightedIndex::new(self.level_weight.iter().copied()).unwrap();
+        let levels_sampler = WeightedIndex::new(self.level_weight.iter().copied()).ok()?;
         let level = levels_sampler.sample(rng);
 
         loop {
@@ -172,7 +172,7 @@ impl DynamicWeightedSampler {
             debug_assert!(weight <= self.level_max[level] && (level == self.n_levels - 1 || (self.level_max[level+1] < weight )));
             let u = rng.random::<f64>() * self.level_max[level];
             if u <= weight {
-                break sampled_id;
+                break Some(sampled_id);
             }
         }
     }
@@ -259,7 +259,7 @@ mod test_weighted_sampler {
         let n_samples = 1_000_000;
         let start = Instant::now();
         for _ in 1..n_samples {
-            let sample = sampler.sample(&mut rng());
+            let sample = sampler.sample(&mut rng()).unwrap();
             *samples.entry(sample).or_default() += 1;
         }
         let duration = start.elapsed();
@@ -275,7 +275,7 @@ mod test_weighted_sampler {
         samples.drain();
         let n_samples = 1_000;
         for _ in 1..n_samples {
-            let sample = sampler.sample(&mut rng());
+            let sample = sampler.sample(&mut rng()).unwrap();
             *samples.entry(sample).or_default() += 1;
         }
 
