@@ -61,6 +61,7 @@ impl DynamicWeightedSampler {
         self.insert_to_level(id, level, weight)
     }
 
+    #[inline(always)]
     fn level(&self, weight: f64) -> usize {
         assert!(weight <= self.max_value, "{weight} > {}", self.max_value);
         assert!(weight > 0.);
@@ -80,7 +81,7 @@ impl DynamicWeightedSampler {
 
     #[inline(always)]
     fn remove_from_level(&mut self, id: usize, level: usize, weight: f64) {
-        assert_eq!(self.level_bucket[level][self.rev_level_bucket[id]], id);
+        debug_assert_eq!(self.level_bucket[level][self.rev_level_bucket[id]], id);
         self.level_weight[level] -= weight;
         let idx_in_level = self.rev_level_bucket[id];
         let last_idx_in_level = self.level_bucket[level].len() - 1;
@@ -152,10 +153,12 @@ impl DynamicWeightedSampler {
         self.level_weight[level] += new_weight - curr_weight;
     }
 
+    #[inline(always)]
     pub fn get_weight(&self, id: usize) -> f64 {
         self.weights[id]
     }
 
+    #[inline(always)]
     pub fn get_total_weight(&self) -> f64 {
         self.total_weight
     }
