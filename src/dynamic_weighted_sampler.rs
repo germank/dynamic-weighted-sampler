@@ -61,7 +61,7 @@ impl DynamicWeightedSampler {
         self.insert_to_level(id, level, weight)
     }
 
-    #[inline(always)]
+    #[inline]
     fn level(&self, weight: f64) -> usize {
         assert!(weight <= self.max_value, "{weight} > {}", self.max_value);
         assert!(weight > 0.);
@@ -72,14 +72,14 @@ impl DynamicWeightedSampler {
         level
     }
 
-    #[inline(always)]
+    #[inline]
     fn insert_to_level(&mut self, id: usize, level: usize, weight: f64) {
         self.level_weight[level] += weight;
         self.level_bucket[level].push(id);
         self.rev_level_bucket[id] = self.level_bucket[level].len() - 1;
     }
 
-    #[inline(always)]
+    #[inline]
     fn remove_from_level(&mut self, id: usize, level: usize, weight: f64) {
         debug_assert_eq!(self.level_bucket[level][self.rev_level_bucket[id]], id);
         self.level_weight[level] -= weight;
@@ -132,14 +132,10 @@ impl DynamicWeightedSampler {
             // If the level didn't change, just update the level's weight
             self.update_weight_in_level(curr_level, curr_weight, new_weight);
         } else {
-            // Otherwise, remove the element from the current level (if any)
-            if curr_weight > 0. {
-                self.remove_from_level(id, curr_level, curr_weight);
-            }
-            // and insert it to the new level (if any)
-            if new_weight > 0. {
-                self.insert_to_level(id, new_level, new_weight);
-            }
+            // Otherwise, remove the element from the current level
+            self.remove_from_level(id, curr_level, curr_weight);
+            // and insert it to the new level
+            self.insert_to_level(id, new_level, new_weight);
         }
     }
 
@@ -148,17 +144,17 @@ impl DynamicWeightedSampler {
         self.update(id, new_weight);
     }
 
-    #[inline(always)]
+    #[inline]
     fn update_weight_in_level(&mut self, level: usize, curr_weight: f64, new_weight: f64) {
         self.level_weight[level] += new_weight - curr_weight;
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn get_weight(&self, id: usize) -> f64 {
         self.weights[id]
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn get_total_weight(&self) -> f64 {
         self.total_weight
     }

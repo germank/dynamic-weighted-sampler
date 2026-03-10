@@ -26,14 +26,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dynamic_weighted_sampler = "0.1"
+dynamic_weighted_sampler = "0.2"
 ```
 
 To enable serialization support:
 
 ```toml
 [dependencies]
-dynamic_weighted_sampler = { version = "0.1", features = ["serde"] }
+dynamic_weighted_sampler = { version = "0.2", features = ["serde"] }
 ```
 
 ---
