@@ -1,161 +1,231 @@
-use rand::{distr::weighted::WeightedIndex, seq::IteratorRandom, Rng};
+use rand::{Rng, RngExt, distr::{weighted::WeightedIndex, uniform::SampleUniform}, seq::IteratorRandom};
 use rand_distr::Distribution;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use sugars::cvec;
 
 const DEFAULT_CAPACITY: usize = 1000;
 
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DynamicWeightedSampler {
-    max_value: f64,
-    n_levels: usize,
-    total_weight: f64,
-    weights: Vec<f64>,
-    level_weight: Vec<f64>,
-    level_bucket: Vec<Vec<usize>>,
-    rev_level_bucket: Vec<usize>, // maps id -> idx within a level
-    level_max: Vec<f64>,
+pub trait Float:
+    Copy
+    + Default
+    + PartialEq
+    + PartialOrd
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::AddAssign
+    + std::ops::SubAssign
+    + std::fmt::Debug
+    + std::fmt::Display
+    + std::ops::Mul<Output = Self>
+    + rand::distr::weighted::Weight  // needed for WeightedIndex
+    + SampleUniform                  // needed for WeightedIndex struct bound
+    + 'static
+{
+    /// `ceil(log2(self))` computed via bit manipulation.
+    fn log2_ceil_bits(self) -> usize;
+
+    /// `2^exp` as `Self`.
+    fn two_pow(exp: usize) -> Self;
+
+    /// Sample a uniform value in `[0, 1)`.
+    fn random_unit<R: Rng + ?Sized>(rng: &mut R) -> Self;
 }
 
-impl DynamicWeightedSampler {
-    pub fn new(max_value: f64) -> Self {
+impl Float for f32 {
+    #[inline] fn log2_ceil_bits(self) -> usize { log2_ceil2_f32(self) }
+    #[inline] fn two_pow(exp: usize) -> Self    { 2.0f32.powi(exp as i32) }
+    #[inline] fn random_unit<R: Rng + ?Sized>(rng: &mut R) -> Self { rng.random::<f32>() }
+}
+
+impl Float for f64 {
+    #[inline] fn log2_ceil_bits(self) -> usize { log2_ceil2_f64(self) }
+    #[inline] fn two_pow(exp: usize) -> Self    { 2.0f64.powi(exp as i32) }
+    #[inline] fn random_unit<R: Rng + ?Sized>(rng: &mut R) -> Self { rng.random::<f64>() }
+}
+
+// ─── Slot ─────────────────────────────────────────────────────────────────────
+
+/// Fused per-element data: weight, level, and index within the level bucket.
+/// f32 variant: 12 bytes (4-aligned). f64 variant: 16 bytes (8-aligned, power-of-2).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+struct Slot<W> {
+    weight: W,
+    idx_in_level: u32,
+    level: u8,
+    _pad: [u8; 3],
+}
+
+impl<W: Float> Default for Slot<W> {
+    fn default() -> Self {
+        // W::default() == 0.0 for both f32 and f64
+        Self { weight: W::default(), idx_in_level: 0, level: 0, _pad: [0; 3] }
+    }
+}
+
+// ─── DynamicWeightedSampler ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DynamicWeightedSampler<W: Float = f32> {
+    max_value: W,
+    n_levels: usize,
+    total_weight: W,
+    slots: Vec<Slot<W>>,
+    level_weight: Vec<W>,
+    level_bucket: Vec<Vec<u32>>, // u32 instead of usize: 2× cache density
+    level_max: Vec<W>,
+}
+
+impl<W: Float> DynamicWeightedSampler<W> {
+    pub fn new(max_value: W) -> Self {
         Self::new_with_capacity(max_value, DEFAULT_CAPACITY)
     }
 
-    pub fn new_with_capacity(max_value: f64, physical_capacity: usize) -> Self {
+    pub fn new_with_capacity(max_value: W, physical_capacity: usize) -> Self {
         assert!(physical_capacity > 0);
-        let n_levels = max_value.log2().ceil() as usize + 1;
-        let max_value = 2f64.powf(max_value.log2().ceil());
-        let total_weight = 0.;
-        let weights = vec![0.; physical_capacity];
-        let level_weight = vec![0.; n_levels];
+        let n_levels = max_value.log2_ceil_bits() + 1;
+        let max_value = W::two_pow(max_value.log2_ceil_bits());
+        let slots = vec![Slot::default(); physical_capacity];
+        let level_weight = vec![W::default(); n_levels];
         let level_bucket = vec![vec![]; n_levels];
-        let rev_level_bucket = vec![0; physical_capacity];
         let top_level = n_levels - 1;
-        let level_max = cvec![2usize.pow(top_level as u32 - i) as f64; i in 0u32..(n_levels as u32)];
+        let level_max: Vec<W> = (0..n_levels).map(|i| W::two_pow(top_level - i)).collect();
         Self {
             max_value,
             n_levels,
-            total_weight,
-            weights,
+            total_weight: W::default(),
+            slots,
             level_weight,
             level_bucket,
-            rev_level_bucket,
             level_max,
         }
     }
 
-    pub fn insert(&mut self, id: usize, weight: f64) {
-        assert!(weight > 0.);
-        if id > self.weights.len() - 1 {
-            self.weights.resize(id + 1, 0.);
-            self.rev_level_bucket.resize(id + 1, 0);
+    pub fn insert(&mut self, id: usize, weight: W) {
+        assert!(weight > W::default());
+        if id > self.slots.len() - 1 {
+            self.slots.resize(id + 1, Slot::default());
         }
-        assert!(self.weights[id] == 0., "Inserting element id {id} with weight {weight}, but it already existed with weight {}", self.weights[id]);
+        assert!(self.slots[id].weight == W::default(), "Inserting element id {id} with weight {weight}, but it already existed with weight {}", self.slots[id].weight);
         assert!(weight <= self.max_value, "Adding element {id} with weight {weight} exceeds the maximum weight capacity of {}", self.max_value);
-        self.weights[id] = weight;
-        self.total_weight += weight;
         let level = self.level(weight);
-        self.insert_to_level(id, level, weight)
+        self.slots[id].weight = weight;
+        self.total_weight += weight;
+        self.insert_to_level(id, level, weight);
     }
 
     #[inline]
-    fn level(&self, weight: f64) -> usize {
-        assert!(weight <= self.max_value, "{weight} > {}", self.max_value);
-        assert!(weight > 0.);
+    fn level(&self, weight: W) -> usize {
+        debug_assert!(weight <= self.max_value, "{weight} > {}", self.max_value);
+        debug_assert!(weight > W::default());
         let top_level = self.n_levels - 1;
-        let level_from_top = log2_ceil2(weight);
-        assert!(top_level >= level_from_top);
-        let level =  top_level - level_from_top;
-        level
+        let level_from_top = weight.log2_ceil_bits();
+        debug_assert!(top_level >= level_from_top);
+        top_level - level_from_top
     }
 
     #[inline]
-    fn insert_to_level(&mut self, id: usize, level: usize, weight: f64) {
+    fn insert_to_level(&mut self, id: usize, level: usize, weight: W) {
         self.level_weight[level] += weight;
-        self.level_bucket[level].push(id);
-        self.rev_level_bucket[id] = self.level_bucket[level].len() - 1;
+        let idx = self.level_bucket[level].len() as u32;
+        self.level_bucket[level].push(id as u32);
+        self.slots[id].idx_in_level = idx;
+        self.slots[id].level = level as u8;
     }
 
     #[inline]
-    fn remove_from_level(&mut self, id: usize, level: usize, weight: f64) {
-        debug_assert_eq!(self.level_bucket[level][self.rev_level_bucket[id]], id);
+    fn remove_from_level(&mut self, id: usize, level: usize, weight: W) {
+        debug_assert_eq!(self.level_bucket[level][self.slots[id].idx_in_level as usize] as usize, id);
         self.level_weight[level] -= weight;
-        let idx_in_level = self.rev_level_bucket[id];
+        let idx_in_level = self.slots[id].idx_in_level as usize;
         let last_idx_in_level = self.level_bucket[level].len() - 1;
         if idx_in_level != last_idx_in_level {
-            // swap with last element
-            let id_in_last_idx = self.level_bucket[level][last_idx_in_level];
+            let id_in_last = self.level_bucket[level][last_idx_in_level] as usize;
             self.level_bucket[level].swap(idx_in_level, last_idx_in_level);
-            self.rev_level_bucket[id_in_last_idx] = idx_in_level;
+            self.slots[id_in_last].idx_in_level = idx_in_level as u32;
         }
-        // idx is last, just remove
         self.level_bucket[level].pop();
-        self.rev_level_bucket[id] = 0;
+        self.slots[id].idx_in_level = 0;
+        self.slots[id].level = 0;
     }
 
-    pub fn remove(&mut self, id: usize) -> f64 {
-        assert!(self.weights[id] > 0., "removing element {id} with 0 weight");
-        let weight = self.weights[id];
-        self.weights[id] = 0.;
-        self.total_weight -= weight;
-        let level = self.level(weight);
-        self.remove_from_level(id, level, weight);
-        weight
+    pub fn remove(&mut self, id: usize) -> W {
+        let slot = self.slots[id]; // single cache-line fetch: weight + level + idx_in_level
+        debug_assert!(slot.weight > W::default(), "removing element {id} with 0 weight");
+        self.slots[id].weight = W::default();
+        self.total_weight -= slot.weight;
+        self.remove_from_level(id, slot.level as usize, slot.weight);
+        slot.weight
     }
 
-    pub fn update(&mut self, id: usize, new_weight: f64) {
-        if self.get_weight(id) == new_weight {
-            // nothing to do
+    pub fn update(&mut self, id: usize, new_weight: W) {
+        let slot = self.slots[id]; // single read
+        if slot.weight == new_weight {
             return;
         }
-        if new_weight == 0. {
-            // remove it completely if the weight is 0
-            self.remove(id);
-            return
+        if new_weight == W::default() {
+            // inline remove to avoid re-reading slots[id]
+            debug_assert!(slot.weight > W::default(), "removing element {id} with 0 weight");
+            self.slots[id].weight = W::default();
+            self.total_weight -= slot.weight;
+            self.remove_from_level(id, slot.level as usize, slot.weight);
+            return;
         }
-        let curr_weight = self.weights[id];
-        if curr_weight == 0. {
-            // if the previous weight was 0, just insert it
+        if slot.weight == W::default() {
             self.insert(id, new_weight);
             return;
         }
-        // otherwise update the weight
-        let curr_level = self.level(curr_weight);
         let new_level = self.level(new_weight);
-        // Update the weight at the global level
-        self.total_weight += new_weight - curr_weight;
-        self.weights[id] = new_weight;
-        if curr_level == new_level {
-            // If the level didn't change, just update the level's weight
-            self.update_weight_in_level(curr_level, curr_weight, new_weight);
+        self.total_weight += new_weight;
+        self.total_weight -= slot.weight;
+        self.slots[id].weight = new_weight;
+        if slot.level as usize == new_level {
+            // inline update_weight_in_level to avoid function call overhead
+            self.level_weight[slot.level as usize] += new_weight;
+            self.level_weight[slot.level as usize] -= slot.weight;
         } else {
-            // Otherwise, remove the element from the current level
-            self.remove_from_level(id, curr_level, curr_weight);
-            // and insert it to the new level
+            self.remove_from_level(id, slot.level as usize, slot.weight);
             self.insert_to_level(id, new_level, new_weight);
         }
     }
 
-    pub fn update_delta(&mut self, id: usize, delta: f64) {
-        let new_weight = self.weights.get(id).unwrap_or(&0.) + delta;
-        self.update(id, new_weight);
+    pub fn update_delta(&mut self, id: usize, delta: W) {
+        let slot = self.slots[id]; // single read
+        let new_weight = slot.weight + delta;
+        if new_weight == slot.weight {
+            return;
+        }
+        if new_weight <= W::default() {
+            if slot.weight > W::default() {
+                self.slots[id].weight = W::default();
+                self.total_weight -= slot.weight;
+                self.remove_from_level(id, slot.level as usize, slot.weight);
+            }
+            return;
+        }
+        if slot.weight == W::default() {
+            self.insert(id, new_weight);
+            return;
+        }
+        let new_level = self.level(new_weight);
+        self.total_weight += delta;
+        self.slots[id].weight = new_weight;
+        if slot.level as usize == new_level {
+            self.level_weight[slot.level as usize] += delta;
+        } else {
+            self.remove_from_level(id, slot.level as usize, slot.weight);
+            self.insert_to_level(id, new_level, new_weight);
+        }
     }
 
     #[inline]
-    fn update_weight_in_level(&mut self, level: usize, curr_weight: f64, new_weight: f64) {
-        self.level_weight[level] += new_weight - curr_weight;
+    pub fn get_weight(&self, id: usize) -> W {
+        self.slots[id].weight
     }
 
     #[inline]
-    pub fn get_weight(&self, id: usize) -> f64 {
-        self.weights[id]
-    }
-
-    #[inline]
-    pub fn get_total_weight(&self) -> f64 {
+    pub fn get_total_weight(&self) -> W {
         self.total_weight
     }
 
@@ -166,10 +236,12 @@ impl DynamicWeightedSampler {
 
         loop {
             let idx_in_level = (0..self.level_bucket[level].len()).choose(rng).unwrap();
-            let sampled_id = self.level_bucket[level][idx_in_level];
-            let weight = self.weights[sampled_id];
-            debug_assert!(weight <= self.level_max[level] && (level == self.n_levels - 1 || (self.level_max[level+1] < weight )));
-            let u = rng.random::<f64>() * self.level_max[level];
+            let sampled_id = self.level_bucket[level][idx_in_level] as usize;
+            let weight = self.slots[sampled_id].weight;
+            // Split into two asserts to avoid type-inference confusion between W and usize.
+            debug_assert!(weight <= self.level_max[level]);
+            debug_assert!(level == self.n_levels - 1 || self.level_max[level + 1] < weight);
+            let u = W::random_unit(rng) * self.level_max[level];
             if u <= weight {
                 break Some(sampled_id);
             }
@@ -177,74 +249,37 @@ impl DynamicWeightedSampler {
     }
 
     pub fn check_invariant(&self) -> bool {
-        self.level_weight.iter().sum::<f64>() == self.total_weight &&
-        self.weights.iter().sum::<f64>() == self.total_weight &&
-            self.total_weight <= self.max_value
+        let sum_level = self.level_weight.iter().fold(W::default(), |acc, &w| acc + w);
+        let sum_slots = self.slots.iter().fold(W::default(), |acc, s| acc + s.weight);
+        sum_level == self.total_weight
+            && sum_slots == self.total_weight
+            && self.total_weight <= self.max_value
     }
 }
 
-fn log2_ceil2(weight: f64) -> usize {
-    let b: u64 = weight.to_bits();
-    // let s = (b >> 63) & 1;
-    let e = (b >> 52) & ((1<<11)-1);
-    let frac = b & ((1<<52) -1);
-    let z = if frac==0 { e as i64 - 1023 } else { e as i64 -1022 };
+// ─── log2_ceil helpers ────────────────────────────────────────────────────────
+
+fn log2_ceil2_f32(weight: f32) -> usize {
+    let b: u32 = weight.to_bits();
+    let e = (b >> 23) & 0xFF;        // 8-bit exponent field
+    let frac = b & ((1 << 23) - 1); // 23-bit mantissa
+    let z = if frac == 0 { e as i32 - 127 } else { e as i32 - 126 };
     z as usize
 }
 
-fn _log2_ceil(weight: f64) -> usize {
-    // Define a lookup table with the first 34 powers of two, starting from 1.0
-    let lookup_table: [f64; 34] = [
-        1.0,          // ceil(log2(weight)) == 0 for (0, 1.0]
-        2.0,          // ceil(log2(weight)) == 1 for (1.0, 2.0]
-        4.0,          // ceil(log2(weight)) == 2 for (2.0, 4.0]
-        8.0,          // ceil(log2(weight)) == 3 for (4.0, 8.0]
-        16.0,         // ceil(log2(weight)) == 4 for (8.0, 16.0]
-        32.0,         // ceil(log2(weight)) == 5 for (16.0, 32.0]
-        64.0,         // ceil(log2(weight)) == 6 for (32.0, 64.0]
-        128.0,        // ceil(log2(weight)) == 7 for (64.0, 128.0]
-        256.0,        // ceil(log2(weight)) == 8 for (128.0, 256.0]
-        512.0,        // ceil(log2(weight)) == 9 for (256.0, 512.0]
-        1024.0,       // ceil(log2(weight)) == 10 for (512.0, 1024.0]
-        2048.0,       // ceil(log2(weight)) == 11 for (1024.0, 2048.0]
-        4096.0,       // ceil(log2(weight)) == 12 for (2048.0, 4096.0]
-        8192.0,       // ceil(log2(weight)) == 13 for (4096.0, 8192.0]
-        16384.0,      // ceil(log2(weight)) == 14 for (8192.0, 16384.0]
-        32768.0,      // ceil(log2(weight)) == 15 for (16384.0, 32768.0]
-        65536.0,      // ceil(log2(weight)) == 16 for (32768.0, 65536.0]
-        131072.0,     // ceil(log2(weight)) == 17 for (65536.0, 131072.0]
-        262144.0,     // ceil(log2(weight)) == 18 for (131072.0, 262144.0]
-        524288.0,     // ceil(log2(weight)) == 19 for (262144.0, 524288.0]
-        1048576.0,    // ceil(log2(weight)) == 20 for (524288.0, 1048576.0]
-        2097152.0,    // ceil(log2(weight)) == 21 for (1048576.0, 2097152.0]
-        4194304.0,    // ceil(log2(weight)) == 22 for (2097152.0, 4194304.0]
-        8388608.0,    // ceil(log2(weight)) == 23 for (4194304.0, 8388608.0]
-        16777216.0,   // ceil(log2(weight)) == 24 for (8388608.0, 16777216.0]
-        33554432.0,   // ceil(log2(weight)) == 25 for (16777216.0, 33554432.0]
-        67108864.0,   // ceil(log2(weight)) == 26 for (33554432.0, 67108864.0]
-        134217728.0,  // ceil(log2(weight)) == 27 for (67108864.0, 134217728.0]
-        268435456.0,  // ceil(log2(weight)) == 28 for (134217728.0, 268435456.0]
-        536870912.0,  // ceil(log2(weight)) == 29 for (268435456.0, 536870912.0]
-        1073741824.0, // ceil(log2(weight)) == 30 for (536870912.0, 1073741824.0]
-        2147483648.0, // ceil(log2(weight)) == 31 for (1073741824.0, 2147483648.0]
-        4294967296.0, // ceil(log2(weight)) == 32 for (2147483648.0, 4294967296.0]
-        8589934592.0, // ceil(log2(weight)) == 33 for (4294967296.0, 8589934592.0]
-    ];
-
-    // Use binary search to find the index in the lookup table.
-    match lookup_table.binary_search_by(|&upper_bound| upper_bound.partial_cmp(&weight).unwrap()) {
-        Ok(index) => index as usize,        // Exact match found
-        Err(_) => weight.log2().ceil() as usize,       // No match, but `Err` gives the insertion point
-    }
+fn log2_ceil2_f64(weight: f64) -> usize {
+    let b: u64 = weight.to_bits();
+    let e = (b >> 52) & ((1 << 11) - 1);
+    let frac = b & ((1 << 52) - 1);
+    let z = if frac == 0 { e as i64 - 1023 } else { e as i64 - 1022 };
+    z as usize
 }
 
 #[cfg(test)]
 mod test_weighted_sampler {
     use std::time::Instant;
-
     use std::collections::HashMap;
     use rand::rng;
-
     use super::*;
 
     #[test]
@@ -263,13 +298,11 @@ mod test_weighted_sampler {
         }
         let duration = start.elapsed();
 
-        assert!(duration.as_secs() <= 3); // 2-3 microseconds per sample
-        approx::assert_abs_diff_eq!(samples[&1] as f64 / n_samples as f64, 0.999, epsilon=1e-4);
-        approx::assert_abs_diff_eq!(samples[&2] as f64 / n_samples as f64, 0.001, epsilon=1e-4);
+        assert!(duration.as_secs() <= 3);
+        approx::assert_abs_diff_eq!(samples[&1] as f32 / n_samples as f32, 0.999, epsilon = 1e-4);
+        approx::assert_abs_diff_eq!(samples[&2] as f32 / n_samples as f32, 0.001, epsilon = 1e-4);
 
-        println!("{:?}", sampler);
         sampler.update(1, 99.);
-        println!("{:?}", sampler);
 
         samples.drain();
         let n_samples = 1_000;
@@ -278,8 +311,26 @@ mod test_weighted_sampler {
             *samples.entry(sample).or_default() += 1;
         }
 
-        approx::assert_abs_diff_eq!(samples[&1] as f64 / n_samples as f64, 0.99, epsilon=1e-2);
-        approx::assert_abs_diff_eq!(samples[&2] as f64 / n_samples as f64, 0.01, epsilon=1e-2);
+        approx::assert_abs_diff_eq!(samples[&1] as f32 / n_samples as f32, 0.99, epsilon = 1e-2);
+        approx::assert_abs_diff_eq!(samples[&2] as f32 / n_samples as f32, 0.01, epsilon = 1e-2);
+    }
+
+    #[test]
+    fn test_distr_f64() {
+        let mut sampler = DynamicWeightedSampler::<f64>::new_with_capacity(1000., 5);
+        let mut samples: HashMap<usize, usize> = HashMap::new();
+
+        sampler.insert(1, 999.);
+        sampler.insert(2, 1.);
+
+        let n_samples = 1_000_000;
+        for _ in 1..n_samples {
+            let sample = sampler.sample(&mut rng()).unwrap();
+            *samples.entry(sample).or_default() += 1;
+        }
+
+        approx::assert_abs_diff_eq!(samples[&1] as f64 / n_samples as f64, 0.999, epsilon = 1e-4);
+        approx::assert_abs_diff_eq!(samples[&2] as f64 / n_samples as f64, 0.001, epsilon = 1e-4);
     }
 
     #[test]
@@ -287,13 +338,13 @@ mod test_weighted_sampler {
         let mut sampler = DynamicWeightedSampler::new_with_capacity(1000., 5);
         let level = sampler.level(500.);
         sampler.insert(1, 500.);
-        assert_eq!(Some(&1), sampler.level_bucket[level].get(0));
+        assert_eq!(Some(&1u32), sampler.level_bucket[level].get(0));
         sampler.insert(2, 510.);
-        assert_eq!(Some(&2), sampler.level_bucket[level].get(1));
+        assert_eq!(Some(&2u32), sampler.level_bucket[level].get(1));
         sampler.remove(1);
-        assert_eq!(Some(&2), sampler.level_bucket[level].get(0));
+        assert_eq!(Some(&2u32), sampler.level_bucket[level].get(0));
         sampler.insert(1, 500.);
-        assert_eq!(Some(&1), sampler.level_bucket[level].get(1));
+        assert_eq!(Some(&1u32), sampler.level_bucket[level].get(1));
         sampler.remove(1);
     }
 
@@ -301,9 +352,9 @@ mod test_weighted_sampler {
     fn test_level() {
         let sampler = DynamicWeightedSampler::new_with_capacity(1000., 5);
         assert_eq!(11, sampler.n_levels);
-        assert_eq!(11-1, sampler.level(1.));
-        assert_eq!(11-2, sampler.level(2.));
-        assert_eq!(11-3, sampler.level(3.));
-        assert_eq!(11-3, sampler.level(4.));
+        assert_eq!(11 - 1, sampler.level(1.));
+        assert_eq!(11 - 2, sampler.level(2.));
+        assert_eq!(11 - 3, sampler.level(3.));
+        assert_eq!(11 - 3, sampler.level(4.));
     }
 }
